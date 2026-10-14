@@ -1,0 +1,10 @@
+#!/bin/bash
+
+while :; do
+  ./dinoisland c nogui
+  last_log=log/log`ls -1 log/* | sed 's/log\/log//' | sort -n | tail -1`
+  last_eggs=`grep '^eggs: ' $last_log | awk '{print $2}'`
+  if test $last_eggs -gt 10; then
+    ./dinoisland h nogui
+  fi
+done

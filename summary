@@ -1,0 +1,49 @@
+#!/bin/bash
+
+rows=5
+clear
+
+if test $(ls -1 log | wc -l) -eq 0; then
+  echo 'no logs'
+  echo
+  exit
+fi
+
+herb_count=`cat log/* | grep -c 'myType: 1'`
+echo herbivore: $herb_count
+if test $herb_count -gt 0; then
+  herb_done_count=`cat \`grep -H 'myType: 1' log/* | awk -F: '{print $1}'\` | grep -c score:`
+  if test $herb_done_count -gt 0; then
+    grep -H score: `grep -l 'myType: 1' log/*` | sed 's/:/ /' | awk '{ print $3 " " $1}' | sort -rn | head -$rows | sed 's/log\///'
+  fi
+fi
+echo
+
+carn_count=`cat log/* | grep -c 'myType: 2'`
+echo carnivore: $carn_count
+if test $carn_count -gt 0; then
+  carn_done_count=`cat \`grep -H 'myType: 2' log/* | awk -F: '{print $1}'\` | grep -c score:`
+  if test $carn_done_count -gt 0; then
+    grep -H score: `grep -l 'myType: 2' log/*` | sed 's/:/ /' | awk '{ print $3 " " $1}' | sort -rn | head -$rows | sed 's/log\///'
+  fi
+fi
+echo
+
+running=`ps ax | grep dinoisland | grep -v grep | wc -l`
+if test $running -eq 0; then
+  echo "not running"
+else
+  last_log=log/log`ls -1 log/* | sed 's/log\/log//' | sort -n | tail -1`
+  last_time="`ls -l $last_log | awk '{print $6 " " $7}'`"
+  last_sec=`date -d"$last_time" +%s`
+  diff=`echo "scale=1; (\`date +%s\`-$last_sec)/60" | bc`
+  cal=`grep "look cost" $last_log | awk '{print $3}'`
+  if test $cal -lt 50; then
+    t=carnivore
+  else
+    t=herbivore
+  fi
+  dinos=$((`ps -eLf | grep dinoisland | grep -v grep | wc -l`-2))
+  echo "running: $last_log - $t - $diff min ($dinos dinos)"
+fi
+echo

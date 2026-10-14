@@ -1,0 +1,667 @@
+#!/usr/bin/python
+
+# size of each dot on the map - smaller than 5 makes it tough to click them
+pixSize = 5
+
+import sys
+import os
+import threading
+import random
+import math
+import time
+
+sys.path.append('gen-py')
+from dinoisland import *
+from dinoisland.ttypes import *
+
+from thrift import Thrift
+from thrift.transport import TSocket
+from thrift.transport import TTransport
+from thrift.protocol import TBinaryProtocol
+
+from Tkinter import *
+import tkMessageBox
+
+# the difference between herbivore and carnivore are just these variables
+# initSize:
+#   the size a dino grows to before egging (also passes enough
+#   calories to egg so new dino can grow to this size right away
+# initMinMoves:
+#   make sure after growing or egging, I have enough calories left
+#   over for this many moves
+# initFoodDist:
+#   how far away I'm willing to go when first searching for food (this
+#   temporarily increases if I can't find any food)
+# whenbumpXXXX:
+#   the 3 init variables grow as we have more live dinos.  every time
+#   we get this many dinos, bump them
+# pctDistBeforeLooking:
+#   cover this fraction of the distance to food before looking
+#   1 means don't look on the way to food
+# foodLargerBy:
+#   only go after food that is this much larger than me or less
+if len(sys.argv) > 1 and sys.argv[1][0] == 'h':
+  myType = EntityType.HERBIVORE
+  foodType = EntityType.PLANT
+  initSize = 4
+  initMinMoves = 7
+  initFoodDist = 5
+  # whenbumpSize controls how fast the dinos multiply
+  #   14 was good before server started limiting simultaneous connections
+  #   7 prevents failed connection after server started limiting
+  whenbumpSize = random.randint(7,14)
+  whenbumpMinMoves = 16
+  whenbumpFoodDist = 6
+  pctDistBeforeLooking = 1
+  foodLargerBy = 0
+  widenSearchOnFail = 1
+elif len(sys.argv) > 1 and sys.argv[1][0] == 'c':
+  myType = EntityType.CARNIVORE
+  foodType = EntityType.HERBIVORE
+  initSize = 25
+  initMinMoves = 20
+  initFoodDist = 10
+  whenbumpSize = 100
+  whenbumpMinMoves = 100
+  whenbumpFoodDist = 100
+  pctDistBeforeLooking = 0.5
+  foodLargerBy = 40
+  widenSearchOnFail = 2
+else:
+  print 'usage:', sys.argv[0], '[h or c] [nogui]'
+  quit()
+
+if len(sys.argv) > 2 and sys.argv[2] == 'nogui':
+  gui = 0
+else:
+  gui = 1
+
+def movePoint(dir,x,y):
+  if dir == 0 or dir == 1 or dir == 7:
+    y=y-1
+  if dir == 3 or dir == 4 or dir == 5:
+    y=y+1
+  if dir == 5 or dir == 6 or dir == 7:
+    x=x-1
+  if dir == 1 or dir == 2 or dir == 3:
+    x=x+1
+  return (x,y)
+ 
+class DinoCount():
+  def __init__(self):
+    self.numDinos = 0
+    self.numEgg = 0
+    self.numBadEgg = 0
+    self.numHatch = 0
+    self.numOldAge = 0
+    self.numStarved = 0
+    self.numDevoured = 0
+    self.numClobbered = 0
+    self.numExtinct = 0
+  def setNumDinos(self,cnt):
+    self.numDinos = cnt
+    if gui:
+      app.dinoLabel.configure(text=str(cnt))
+  def addEgg(self):
+    self.numEgg = self.numEgg + 1
+    if gui:
+      app.eggLabel.configure(text=str(self.numEgg))
+  def addBadEgg(self):
+    self.numBadEgg = self.numBadEgg + 1
+    if gui:
+      app.badEggLabel.configure(text=str(self.numBadEgg))
+  def addHatch(self):
+    self.numHatch = self.numHatch + 1
+    if gui:
+      app.hatchLabel.configure(text=str(self.numHatch))
+  def addOldAge(self):
+    self.numOldAge = self.numOldAge + 1
+    if gui:
+      app.oldAgeLabel.configure(text=str(self.numOldAge))
+  def addStarved(self):
+    self.numStarved = self.numStarved + 1
+    if gui:
+      app.starvedLabel.configure(text=str(self.numStarved))
+  def addDevoured(self):
+    self.numDevoured = self.numDevoured + 1
+    if gui:
+      app.devouredLabel.configure(text=str(self.numDevoured))
+  def addClobbered(self):
+    self.numClobbered = self.numClobbered + 1
+    if gui:
+      app.clobberedLabel.configure(text=str(self.numClobbered))
+  def addExtinct(self):
+    self.numExtinct = self.numExtinct + 1
+    if gui:
+      app.extinctLabel.configure(text=str(self.numExtinct))
+
+class DinoApp():
+  def __init__(self):
+    self.pix = {}
+    self.mapSize = 600
+    self.bg_color = '#ffffff'
+
+    self.root = Tk()
+    self.root.grid()
+
+    self.xscrollbar = Scrollbar(self.root, orient=HORIZONTAL)
+    self.xscrollbar.grid(row=10, column=0, sticky=E+W)
+
+    self.yscrollbar = Scrollbar(self.root)
+    self.yscrollbar.grid(row=0, column=1, rowspan=10, sticky=N+S)
+
+    # must make our map twice the size because we don't know where we start
+    self.canv = Canvas(self.root, bg=self.bg_color,
+                    height=self.mapSize, width=self.mapSize, 
+                    scrollregion=(0, 0,
+                                  self.mapSize*2*pixSize,
+                                  self.mapSize*2*pixSize),
+                    xscrollcommand=self.xscrollbar.set,
+                    yscrollcommand=self.yscrollbar.set)
+    self.canv.grid(row=0, column=0, rowspan=9, sticky=N+W)
+
+    self.xscrollbar.config(command=self.canv.xview)
+    self.yscrollbar.config(command=self.canv.yview)
+
+    self.canv.xview(MOVETO, 0.5-(0.5/(2*pixSize)))
+    self.canv.yview(MOVETO, 0.5-(0.5/(2*pixSize)))
+
+    self.canv.bind("<Button-1>", self.printInfo)
+
+    Label(self.root, text='Status:', width=10).grid(row=0, column=2, sticky=W)
+    self.statusLabel = Label(self.root, text='Running', width=30)
+    self.statusLabel.grid(row=0, column=3, sticky=W)
+
+    Label(self.root, text='Eggs:', width=10).grid(row=1, column=2, sticky=W)
+    self.eggLabel = Label(self.root, text='0', width=30)
+    self.eggLabel.grid(row=1, column=3, sticky=W)
+
+    Label(self.root, text='- Bad eggs:', width=10).grid(row=2, column=2,
+                                                        sticky=W)
+    self.badEggLabel = Label(self.root, text='0', width=30)
+    self.badEggLabel.grid(row=2, column=3, sticky=W)
+
+    Label(self.root, text='= Hatched:', width=10).grid(row=3, column=2,
+                                                       sticky=W)
+    self.hatchLabel = Label(self.root, text='0', width=30)
+    self.hatchLabel.grid(row=3, column=3, sticky=W)
+
+    Label(self.root, text='- Old age:', width=10).grid(row=4, column=2,
+                                                       sticky=W)
+    self.oldAgeLabel = Label(self.root, text='0', width=30)
+    self.oldAgeLabel.grid(row=4, column=3, sticky=W)
+
+    Label(self.root, text='- Starved:', width=10).grid(row=5, column=2,
+                                                       sticky=W)
+    self.starvedLabel = Label(self.root, text='0', width=30)
+    self.starvedLabel.grid(row=5, column=3, sticky=W)
+
+    Label(self.root, text='- Devoured:', width=10).grid(row=6, column=2,
+                                                        sticky=W)
+    self.devouredLabel = Label(self.root, text='0', width=30)
+    self.devouredLabel.grid(row=6, column=3, sticky=W)
+
+    Label(self.root, text='- Clobbered:', width=10).grid(row=7, column=2,
+                                                         sticky=W)
+    self.clobberedLabel = Label(self.root, text='0', width=30)
+    self.clobberedLabel.grid(row=7, column=3, sticky=W)
+
+    Label(self.root, text='- Extinct:', width=10).grid(row=8, column=2,
+                                                       sticky=W)
+    self.extinctLabel = Label(self.root, text='0', width=30)
+    self.extinctLabel.grid(row=8, column=3, sticky=W)
+
+    Label(self.root, text='= Dinos:', width=10).grid(row=9, column=2,
+                                                     sticky=W)
+    self.dinoLabel = Label(self.root, text='0', width=30)
+    self.dinoLabel.grid(row=9, column=3, sticky=W)
+
+  def start(self):
+    self.root.mainloop()
+
+  def printInfo(self,event):
+    try:
+      self.canv.delete(self.popupBack)
+      self.canv.delete(self.popupTxt)
+    except:
+      pass
+    xPix = int(event.x + self.xscrollbar.get()[0]*self.mapSize*2*pixSize)-1
+    yPix = int(event.y + self.yscrollbar.get()[0]*self.mapSize*2*pixSize)-1
+    x = (xPix / pixSize) - self.mapSize
+    y = (yPix / pixSize) - self.mapSize
+    if (x,y) in map.map:
+      ent = map.map[x,y]
+      if ent.type == EntityType.PLANT:
+        msg = 'Plant\n'
+      elif ent.type == EntityType.HERBIVORE:
+        msg = 'Herbivore\n'
+      elif ent.type == EntityType.CARNIVORE:
+        msg = 'Carnivore\n'
+      elif ent.type == EntityType.IMPASSABLE:
+        msg = 'Rock\n'
+      msg = msg + 'species=' + ent.species + '\n'
+      if ent.species == 'You' and (x,y) in map.spaceMap:
+        dino = map.spaceMap[x,y]
+        msg = msg + 'size=' + str(dino.state.size) + '\n'
+        msg = msg + 'calories=' + str(dino.state.calories) + '\n'
+      else:
+        msg = msg + 'size=' + str(ent.size) + '\n'
+      self.popupBack = self.canv.create_rectangle(xPix,yPix,xPix+300,yPix+70,
+                                                  fill='#cccccc')
+      self.popupTxt = self.canv.create_text(xPix+5,yPix+5,fill='#000000',
+                                            anchor=NW,text=msg)
+
+  def setStatus(self,txt):
+    self.statusLabel.configure(text=txt)
+
+  def add(self,type,species,x,y):
+    if (x,y) in self.pix:
+      self.remove(x,y)
+    if species == 'You':
+      color = '#8b4513'
+    else:
+      if type == EntityType.PLANT:
+        color = '#00ff00'
+      elif type == EntityType.HERBIVORE:
+        color = '#0000ff'
+      elif type == EntityType.CARNIVORE:
+        color = '#ff0000'
+      elif type == EntityType.IMPASSABLE:
+        color = '#000000'
+    self.pix[x,y] = self.canv.create_rectangle((x+self.mapSize)*pixSize,
+                                              (y+self.mapSize)*pixSize,
+                                              (x+self.mapSize+1)*pixSize-1,
+                                              (y+self.mapSize+1)*pixSize-1,
+                                              fill=color, outline='')
+
+  def remove(self,x,y):
+    self.canv.delete(self.pix[x,y])
+
+class DinoMapEntity():
+  def __init__(self,type,species,size,eggID=0):
+    self.type = type
+    self.species = species
+    self.size = size
+    self.eggID = eggID
+
+class DinoMap():
+  def __init__(self):
+    self.map = {}
+    self.spaceMap = {}
+    self.foodMap = {}
+    self.spaceLock = threading.Lock()
+    self.foodLock = threading.Lock()
+
+    # dict of all the spaces with size 1 or bigger entities a size 4 dino
+    # can see in each direction.  use this to "erase" entities if they aren't
+    # there anymore on subsequent looks
+    self.lookDist = {}
+    for i in range(0,8):
+      self.lookDist[i] = []
+    for i in range(-16,17):
+      for j in range(-16,17):
+        if i**2 + j**2 <= 272:
+          if j<0 and abs(i)<=abs(j):
+            self.lookDist[0].append((i,j))
+          if j<0 and i>0:
+            self.lookDist[1].append((i,j))
+          if i>0 and abs(j)<=abs(i):
+            self.lookDist[2].append((i,j))
+          if j>0 and i>0:
+            self.lookDist[3].append((i,j))
+          if j>0 and abs(i)<=abs(j):
+            self.lookDist[4].append((i,j))
+          if j>0 and i<0:
+            self.lookDist[5].append((i,j))
+          if i<0 and abs(j)<=abs(i):
+            self.lookDist[6].append((i,j))
+          if j<0 and i<0:
+            self.lookDist[7].append((i,j))
+
+  def lockSpace(self,dino,x,y):
+    self.spaceLock.acquire()
+    if (x,y) in self.spaceMap:
+      self.spaceLock.release()
+      return False
+    self.spaceMap[x,y] = dino
+    self.spaceLock.release()
+    return True
+  def unlockSpace(self,x,y):
+    del(self.spaceMap[x,y])
+
+  def lockFood(self,x,y):
+    self.foodLock.acquire()
+    if (x,y) in self.foodMap:
+      self.foodLock.release()
+      return False
+    self.foodMap[x,y] = 1
+    self.foodLock.release()
+    return True
+  def unlockFood(self,x,y):
+    del(self.foodMap[x,y])
+
+  def add(self, x, y, type, species, size):
+    self.map[x,y] = DinoMapEntity(type, species, size)
+    if gui:
+      app.add(type,species,x,y)
+  def remove(self,x,y):
+    try:
+      del(self.map[x,y])
+      if gui:
+        app.remove(x,y)
+    except:
+      pass
+
+  def nearestFood(self,dino,lookFurther):
+    foodDist = initFoodDist + (count.numDinos / whenbumpFoodDist)
+    x = dino.x
+    y = dino.y
+    size = dino.state.size
+    for dist in range(1,foodDist+lookFurther*widenSearchOnFail+1):
+      for i in range(x-dist,x+dist+1):
+        for j in range(y-dist,y+dist+1):
+          if i==x-dist or i==x+dist or j==y-dist or j==y+dist:
+            if (i,j) in self.map:
+              try:
+                ent = self.map[i,j]
+                if ent.type == foodType and ent.size <= (size+foodLargerBy):
+                  if dino.targetFood == (i,j) or map.lockFood(i,j):
+                    return (True, i, j, max(abs(x-i),abs(y-j)))
+              except:
+                pass
+    return (False,0,0,0)
+
+  def containsRock(self,x,y):
+    return ((x,y) in self.map and self.map[x,y].type == EntityType.IMPASSABLE)
+
+class DinoThread(threading.Thread):
+  def __init__(self,eggID=0,x=0,y=0):
+    threading.Thread.__init__(self)
+    self.eggID = eggID
+    self.x = x
+    self.y = y
+
+  def hatch(self):
+    try:
+      self.state = self.client.hatch(self.eggID)
+    except:
+      raise
+    if self == firstDino:
+      logFile.write('starting calories: ' + str(self.state.calories) + '\n')
+      logFile.write('egg cost: ' + str(self.state.eggCost) + '\n')
+      logFile.write('grow cost: ' + str(self.state.growCost) + '\n')
+      logFile.write('look cost: ' + str(self.state.lookCost) + '\n')
+      logFile.write('move cost: ' + str(self.state.moveCost) + '\n\n')
+      logFile.flush()
+    map.add(self.x,self.y,myType,self.species,self.state.size)
+    count.addHatch()
+
+  def look(self,dir):
+    lookRes = self.client.look(dir)
+    self.state = lookRes.myState
+    if lookRes.succeeded:
+      nearObj = []
+      for ent in lookRes.thingsSeen:
+        # i am at least size=4, can see any entity if x^2 + y^2 <= 272 (r=16.5)
+        if ent.coordinate.column**2 + ent.coordinate.row**2 <= 272:
+          nearObj.append((ent.coordinate.column,ent.coordinate.row))
+        x = ent.coordinate.column + self.x
+        y = ent.coordinate.row + self.y
+        if ent.species != 'You':
+          map.add(x,y,ent.type,ent.species,ent.size)
+      for loc in map.lookDist[dir]:
+        if loc not in nearObj:
+          x = loc[0] + self.x
+          y = loc[1] + self.y
+          if (x,y) in map.map and map.map[(x,y)].species != 'You':
+            map.remove(x,y)
+    return lookRes.succeeded
+
+  def moveTowards(self,x,y):
+    if self.y > y:
+      northSouth = 'N'
+    elif self.y < y:
+      northSouth = 'S'
+    else:
+      northSouth = ''
+    if self.x > x:
+      eastWest = 'W'
+    elif self.x < x:
+      eastWest = 'E'
+    else:
+      eastWest = ''
+    dir = eval('Direction.' + northSouth + eastWest)
+    return (self.move(dir),dir)
+
+  def move(self,dir):
+    if self.state.calories < self.state.moveCost:
+      # look to kill ourselves (to prevent potential infinite move loop)
+      self.look(random.randint(0,7))
+      return False
+
+    (toX, toY) = movePoint(dir,self.x,self.y)
+    if map.containsRock(toX, toY):
+      return False
+
+    if not map.lockSpace(self,toX,toY):
+      return False
+
+    try:
+      moveRes = self.client.move(dir)
+    except:
+      map.unlockSpace(toX,toY)
+      raise
+
+    if not moveRes.succeeded:
+      map.unlockSpace(toX,toY)
+      return False
+
+    self.state = moveRes.myState
+
+    map.remove(self.x,self.y)
+    map.unlockSpace(self.x,self.y)
+
+    (self.x, self.y) = (toX, toY)
+    map.add(self.x,self.y,myType,self.species,self.state.size)
+    return moveRes.succeeded
+
+  def egg(self,dir,cal):
+    (eggX, eggY) = movePoint(dir,self.x,self.y)
+
+    if map.containsRock(eggX, eggY):
+      return False
+
+    if not map.lockSpace(1,eggX,eggY):
+      return False
+
+    try:
+      eggRes = self.client.egg(dir, cal)
+    except:
+      map.unlockSpace(eggX,eggY)
+      raise
+      
+    if not eggRes.succeeded:
+      map.unlockSpace(eggX,eggY)
+      return False
+ 
+    self.state = eggRes.parentDinoState
+    map.spaceMap[eggX,eggY] = DinoThread(eggRes.eggID,eggX,eggY)
+    map.spaceMap[eggX,eggY].start()
+    return eggRes.succeeded
+
+  def grow(self):
+    growRes = self.client.grow()
+    self.state = growRes.myState
+    # could update my size on our map, but don't use that anyway
+    return growRes.succeeded
+
+  def run(self):
+    self.species = 'You'
+    self.targetFood = ''
+
+    socket = TSocket.TSocket('thriftpuzzle.facebook.com',9033)
+    transport = TTransport.TBufferedTransport(socket)
+    protocol = TBinaryProtocol.TBinaryProtocol(transport)
+    self.client = Dinosaur.Client(protocol)
+
+    try:
+      transport.open()
+    except:
+      global failedConnects
+      failedConnects = failedConnects + 1
+      if self != firstDino:
+        map.unlockSpace(self.x,self.y)
+      quit()
+
+    if not self.eggID:
+      registerRes = self.client.registerClient('mtayter@umich.edu', \
+                                               'Michael Tayter',myType)
+      logFile.write('message: '+ registerRes.message + '\n\n')
+      self.eggID = registerRes.eggID
+
+    try:
+      count.setNumDinos(threading.activeCount()-1)
+
+      if self == firstDino:
+        map.lockSpace(self, self.x, self.y)
+
+      count.addEgg()
+      self.hatch()
+
+      if self == firstDino:
+        global growCost, eggCost, moveCost
+        growCost = self.state.growCost
+        eggCost = self.state.eggCost
+        moveCost = self.state.moveCost
+
+      nextLook = 0
+      while 1:
+
+        minCal = (initMinMoves + (count.numDinos/whenbumpMinMoves)) * moveCost
+        dinoSize = initSize + int(count.numDinos/whenbumpSize)
+
+        while self.state.calories >= (minCal + growCost) and \
+              self.state.size < dinoSize:
+          self.grow()
+
+        # 0.8 is for the 20% calories lost in egg
+        giveCalories = (growCost * (dinoSize-1) + minCal) / 0.8
+        eggThreshold = giveCalories + minCal + eggCost
+        while self.state.calories > eggThreshold:
+          while not self.egg(random.randint(0,7), giveCalories):
+            pass
+
+        failedLooks = 0
+        oldCalories = self.state.calories
+        while self.state.calories <= oldCalories:
+          (found,x,y,dist) = map.nearestFood(self,failedLooks)
+          if found:
+            if self.targetFood != (x,y):
+              if self.targetFood:
+                map.unlockFood(*self.targetFood)
+              self.targetFood = (x,y)
+              stepsUntilLook = int(math.floor(dist*pctDistBeforeLooking))+1
+            (success,dir) = self.moveTowards(x,y)
+            if success:
+              stepsUntilLook = stepsUntilLook - 1
+              if stepsUntilLook == 0:
+                self.look(dir)
+                stepsUntilLook = int(math.floor(dist*pctDistBeforeLooking))+1
+          if not found or not success:
+            if self.targetFood:
+              map.unlockFood(*self.targetFood)
+              self.targetFood = ''
+            self.look(nextLook)
+            nextLook = (nextLook+2) % 8
+          if not found:
+            failedLooks = failedLooks + 1
+
+        if self.targetFood:
+          map.unlockFood(*self.targetFood)
+          self.targetFood = ''
+
+    except GameOverException, ex:
+      if gui:
+        app.setStatus('Game Over')
+      try:
+        map.remove(self.x,self.y)
+      except:
+        pass
+      count.setNumDinos(threading.activeCount()-2)
+      count.addExtinct()
+      if gameOverLock.acquire(0):
+        # wait for all other threads to finish (except main)
+        while threading.activeCount() > 2:
+          time.sleep(1)
+        finishLog(ex.message,ex.wonGame,ex.score,ex.highScoreTable)
+    except YouAreDeadException, ex:
+      map.remove(self.x,self.y)
+      map.unlockSpace(self.x,self.y)
+      if self.targetFood:
+        map.unlockFood(*self.targetFood)
+      count.setNumDinos(threading.activeCount()-2)
+      if ex.description.find('devoured') != -1:
+        count.addDevoured()
+      if ex.description.find('clobbered') != -1:
+        count.addClobbered()
+      if ex.description.find('old age') != -1:
+        count.addOldAge()
+      if ex.description.find('starved') != -1:
+        count.addStarved()
+    except BadEggException, ex:
+      map.unlockSpace(self.x,self.y)
+      count.addBadEgg()
+      count.setNumDinos(threading.activeCount()-2)
+
+    transport.close()
+
+def finishLog(gameOverMsg,gameOverWon,gameOverScore,gameOverScoreTable):
+  logFile.write('myType: '+str(myType)+'\n')
+  logFile.write('foodType: '+str(foodType)+'\n')
+  logFile.write('initSize: '+str(initSize)+'\n')
+  logFile.write('initMinMoves: '+str(initMinMoves)+'\n')
+  logFile.write('initFoodDist: '+str(initFoodDist)+'\n')
+  logFile.write('whenbumpSize: '+str(whenbumpSize)+'\n')
+  logFile.write('whenbumpMinMoves: '+str(whenbumpMinMoves)+'\n')
+  logFile.write('whenbumpFoodDist: '+str(whenbumpFoodDist)+'\n')
+  logFile.write('pctDistBeforeLooking: '+str(pctDistBeforeLooking)+'\n')
+  logFile.write('foodLargerBy: '+str(foodLargerBy)+'\n')
+  logFile.write('widenSearchOnFail: '+str(widenSearchOnFail)+'\n\n')
+
+  logFile.write('eggs: '+str(count.numEgg)+'\n')
+  logFile.write('bad eggs: '+str(count.numBadEgg)+'\n')
+  logFile.write('hatched: '+str(count.numHatch)+'\n\n')
+
+  logFile.write('old age: '+str(count.numOldAge)+'\n')
+  logFile.write('starved: '+str(count.numStarved)+'\n')
+  logFile.write('devoured: '+str(count.numDevoured)+'\n')
+  logFile.write('clobbered: '+str(count.numClobbered)+'\n')
+  logFile.write('extinct: '+str(count.numExtinct)+'\n\n')
+ 
+  logFile.write('message: '+gameOverMsg+'\n')
+  logFile.write('wonGame: '+str(gameOverWon)+'\n')
+  logFile.write('score: '+str(gameOverScore)+'\n')
+  logFile.write(gameOverScoreTable+'\n')
+
+  logFile.write('failed connections: '+str(failedConnects)+'\n')
+  logFile.close()
+
+if not 'log' in os.listdir('.'):
+  os.mkdir('log')
+cnt = -1
+for f in os.listdir('log'):
+  if int(f[3:]) > cnt:
+    cnt = int(f[3:])
+logFile = open('log/log'+str(cnt+1),'w')
+
+failedConnects = 0
+gameOverLock = threading.Lock()
+count = DinoCount()
+map = DinoMap()
+firstDino = DinoThread()
+
+if gui:
+  app = DinoApp()
+firstDino.start()
+if gui:
+  app.start()
